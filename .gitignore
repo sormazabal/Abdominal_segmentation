@@ -10,5 +10,6 @@ wheels/
 .venv
 
 /Dataset
+/results
 *.toml
 uv.lock

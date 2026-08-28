@@ -345,6 +345,53 @@ def run_anatomical_segmentation(
     return data, label_map
 
 
+def run_nnunet_segmentation(
+    image: Any,
+    model_dir: str,
+    folds: Sequence[int],
+    device: str,
+    verbose: bool,
+) -> Tuple[np.ndarray, Dict[int, str]]:
+    try:
+        import torch
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+    except ImportError as exc:
+        raise RuntimeError(
+            "nnunetv2 is unavailable. Install it with: python -m pip install nnunetv2"
+        ) from exc
+
+    import tempfile
+    import nibabel as nib
+
+    predictor = nnUNetPredictor(
+        perform_everything_on_device=(device == "cuda"),
+        device=torch.device(device),
+        verbose=verbose,
+    )
+    predictor.initialize_from_trained_model_folder(
+        model_dir, use_folds=folds, checkpoint_name="checkpoint_final.pth"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_dir, out_dir = Path(tmp) / "in", Path(tmp) / "out"
+        in_dir.mkdir()
+        out_dir.mkdir()
+        nib.save(image, in_dir / "case_0000.nii.gz")
+        predictor.predict_from_files(
+            str(in_dir), str(out_dir), save_probabilities=False, overwrite=True
+        )
+        data = np.asarray(nib.load(out_dir / "case.nii.gz").dataobj, dtype=np.uint16)
+
+    labels_raw = json.loads((Path(model_dir) / "dataset.json").read_text())["labels"]
+    label_map = {int(index): str(name) for name, index in labels_raw.items() if name != "background"}
+
+    if data.shape != image.shape:
+        raise RuntimeError(f"Segmentation geometry mismatch: CT {image.shape}, mask {data.shape}.")
+    if not np.any(data):
+        raise RuntimeError("nnU-Net returned an empty segmentation.")
+    return data, label_map
+
+
 def combine_anatomical_masks(
     raw_mask: np.ndarray,
     label_map: Mapping[int, str],
@@ -939,6 +986,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--fast", action="store_true", help="Use 3 mm TotalSegmentator inference.")
     parser.add_argument(
+        "--backend",
+        choices=("totalsegmentator", "nnunet"),
+        default="totalsegmentator",
+        help="Segmentation backbone. nnunet uses labels from its own dataset.json "
+        "(TotalSegmentator's chest-structure grouping does not apply).",
+    )
+    parser.add_argument(
+        "--nnunet-model-dir",
+        help="Trained nnU-Net v2 model folder (e.g. .../DatasetXXX/nnUNetTrainer__nnUNetPlans__3d_fullres). "
+        "Required when --backend nnunet.",
+    )
+    parser.add_argument(
+        "--nnunet-folds",
+        default="0",
+        help="Comma-separated fold indices to ensemble (default: 0).",
+    )
+    parser.add_argument(
         "--slice",
         default="auto",
         help="Axial slice index, 'middle', or 'auto' (default: auto).",
@@ -998,16 +1062,31 @@ def run(args: argparse.Namespace) -> int:
     extras = parse_extra_structures(args.structures)
     model_structures = list(dict.fromkeys((*BASE_MODEL_STRUCTURES, *extras)))
 
-    print("Loading TotalSegmentator...")
-    print("Running anatomical segmentation...")
-    raw_mask, label_map = run_anatomical_segmentation(
-        image=loaded.image,
-        model_structures=model_structures,
-        ts_device=ts_device,
-        fast=args.fast,
-        verbose=args.verbose,
-    )
-    mask, labels = combine_anatomical_masks(raw_mask, label_map, extras)
+    if args.backend == "nnunet":
+        if not args.nnunet_model_dir:
+            raise ValueError("--nnunet-model-dir is required when --backend nnunet.")
+        folds = [int(fold) for fold in args.nnunet_folds.split(",")]
+        print("Loading nnU-Net v2...")
+        print("Running anatomical segmentation...")
+        raw_mask, label_map = run_nnunet_segmentation(
+            image=loaded.image,
+            model_dir=args.nnunet_model_dir,
+            folds=folds,
+            device=torch_device,
+            verbose=args.verbose,
+        )
+        mask, labels = raw_mask, {name: index for index, name in label_map.items()}
+    else:
+        print("Loading TotalSegmentator...")
+        print("Running anatomical segmentation...")
+        raw_mask, label_map = run_anatomical_segmentation(
+            image=loaded.image,
+            model_structures=model_structures,
+            ts_device=ts_device,
+            fast=args.fast,
+            verbose=args.verbose,
+        )
+        mask, labels = combine_anatomical_masks(raw_mask, label_map, extras)
     colors = load_colors(args.colors, list(labels) + ["nodule"])
 
     print("Detecting nodules...")
@@ -1095,8 +1174,8 @@ def run(args: argparse.Namespace) -> int:
             "width": args.window_width,
         },
         "model": {
-            "anatomy": "TotalSegmentator/total",
-            "fast": bool(args.fast),
+            "anatomy": "TotalSegmentator/total" if args.backend == "totalsegmentator" else f"nnunet/{args.nnunet_model_dir}",
+            "fast": bool(args.fast) if args.backend == "totalsegmentator" else None,
             "device": torch_device,
             "hard_labels": True,
             "confidence_note": (

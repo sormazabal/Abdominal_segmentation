@@ -97,6 +97,40 @@ dataset_json = {
 (raw_dataset_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
 print(f"Converted {len(case_dirs)} cases into {raw_dataset_dir}")
 
+# %% [Cell 5-pretrained-check] Confirm the pretrained model identifier before downloading
+# The URL/dataset id below are from memory and may be stale. Fetch the current
+# list and eyeball it for the KiTS23 (kidney+tumor+cyst) entry before proceeding.
+import urllib.request
+print(urllib.request.urlopen(
+    "https://raw.githubusercontent.com/MIC-DKFZ/nnUNet/master/documentation/pretrained_models.md"
+).read().decode())
+
+# %% [Cell 5-pretrained] Skip training: run nnU-Net's official KiTS23 pretrained model
+# KiTS23 = kidney + tumor + cyst, trained on ~600 CT cases — same task as KiTS19,
+# so this is a direct match, not a generic organ atlas. Only needs Cell 1-4 (raw
+# imagesTr/) before this; skip Cell 5 (preprocess) and Cell 6 (train) entirely.
+# Verify the exact identifier before running — nnU-Net's pretrained model list
+# changes: https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/pretrained_models.md
+KITS23_MODEL_URL = "https://zenodo.org/records/10557052/files/Dataset220_KiTS2023.zip"  # verify against the doc link above
+
+predictions_dir = WORK / "predictions_pretrained"
+predictions_dir.mkdir(exist_ok=True)
+
+subprocess.run(
+    ["nnUNetv2_download_pretrained_model_by_url", KITS23_MODEL_URL],
+    check=True,
+)
+subprocess.run(
+    [
+        "nnUNetv2_predict",
+        "-i", str(images_dir),
+        "-o", str(predictions_dir),
+        "-d", "220", "-c", "3d_fullres",  # dataset id/config must match the downloaded model, check its dataset.json
+    ],
+    check=True,
+)
+print(f"Pretrained predictions saved to {predictions_dir}")
+
 # %% [Cell 5] Preprocess
 # Only preprocess the config we'll actually train (skips wasted 3d_lowres/3d_fullres
 # work), and cap worker processes — nnU-Net's default (8 for 2d) OOM'd on Kaggle's

@@ -97,39 +97,90 @@ dataset_json = {
 (raw_dataset_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
 print(f"Converted {len(case_dirs)} cases into {raw_dataset_dir}")
 
-# %% [Cell 5-pretrained-check] Confirm the pretrained model identifier before downloading
-# The URL/dataset id below are from memory and may be stale. Fetch the current
-# list and eyeball it for the KiTS23 (kidney+tumor+cyst) entry before proceeding.
-import urllib.request
-print(urllib.request.urlopen(
-    "https://raw.githubusercontent.com/MIC-DKFZ/nnUNet/master/documentation/pretrained_models.md"
-).read().decode())
+# %% [Cell 5-pretrained] Skip training: run nnU-Net v1's official KiTS pretrained model
+# nnU-Net v2 (nnunetv2) ships NO pretrained models at all — confirmed against its
+# current docs (2026-08): https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/run_inference_with_pretrained_models.md
+# Pretrained weights only exist on the older nnU-Net v1 (`nnunet` package), which
+# includes Task135_KiTS2021 (kidney+tumor+cyst) — an exact match for this task.
+# This installs `nnunet` alongside `nnunetv2`; only needs Cell 1-4's raw imagesTr/
+# (v1 uses the same `<case>_0000.nii.gz` input convention) — skip Cell 5/6/7.
+!pip install -q nnunet
+import subprocess
 
-# %% [Cell 5-pretrained] Skip training: run nnU-Net's official KiTS23 pretrained model
-# KiTS23 = kidney + tumor + cyst, trained on ~600 CT cases — same task as KiTS19,
-# so this is a direct match, not a generic organ atlas. Only needs Cell 1-4 (raw
-# imagesTr/) before this; skip Cell 5 (preprocess) and Cell 6 (train) entirely.
-# Verify the exact identifier before running — nnU-Net's pretrained model list
-# changes: https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/pretrained_models.md
-KITS23_MODEL_URL = "https://zenodo.org/records/10557052/files/Dataset220_KiTS2023.zip"  # verify against the doc link above
+# nnU-Net v1 uses its own env var names (different from v2's nnUNet_raw/etc set
+# in Cell 2) — without these it exits silently before even starting the download.
+V1_WORK = WORK / "nnunet_v1"
+os.environ["nnUNet_raw_data_base"] = str(V1_WORK / "raw_data_base")
+os.environ["nnUNet_preprocessed"] = str(V1_WORK / "preprocessed")
+os.environ["RESULTS_FOLDER"] = str(V1_WORK / "results")
+for path in os.environ["nnUNet_raw_data_base"], os.environ["nnUNet_preprocessed"], os.environ["RESULTS_FOLDER"]:
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 predictions_dir = WORK / "predictions_pretrained"
 predictions_dir.mkdir(exist_ok=True)
 
-subprocess.run(
-    ["nnUNetv2_download_pretrained_model_by_url", KITS23_MODEL_URL],
-    check=True,
-)
+# `nnUNet_download_pretrained_model` is broken as of 2026-08 — it hardcodes an
+# HTTP/1.0 downgrade that Zenodo now 404s on (MIC-DKFZ/nnUNet#2876), so this
+# downloads+extracts the same zip directly instead of shelling out to that CLI.
+# Swap the URL for any other nnU-Net v1 pretrained task — same input convention
+# (<case>_0000.nii.gz), just a different zip/id. Other abdominal CT options:
+# Task003_Liver (liver+tumor), Task007_Pancreas (pancreas+tumor),
+# Task008_HepaticVessel, Task010_Colon — all at zenodo.org/record/4003545.
+PRETRAINED_MODEL_URL = "https://zenodo.org/record/5126443/files/Task135_KiTS2021.zip?download=1"
+PRETRAINED_TASK_ID = "135"
+
+zip_path = WORK / "pretrained_model.zip"
+if not zip_path.exists():
+    response = requests.get(PRETRAINED_MODEL_URL, stream=True, timeout=100)
+    response.raise_for_status()
+    total = int(response.headers.get("content-length", 0))
+    with zip_path.open("wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc="pretrained model") as bar:
+        for chunk in response.iter_content(chunk_size=1 << 20):
+            f.write(chunk)
+            bar.update(len(chunk))
+
+import zipfile
+with zipfile.ZipFile(zip_path) as zf:
+    zf.extractall(os.environ["RESULTS_FOLDER"])
+
 subprocess.run(
     [
-        "nnUNetv2_predict",
+        "nnUNet_predict",
         "-i", str(images_dir),
         "-o", str(predictions_dir),
-        "-d", "220", "-c", "3d_fullres",  # dataset id/config must match the downloaded model, check its dataset.json
+        "-t", PRETRAINED_TASK_ID, "-m", "3d_fullres",
+        "-f", "0",  # single fold instead of the full 5-fold ensemble; drop for full ensemble accuracy
     ],
     check=True,
 )
 print(f"Pretrained predictions saved to {predictions_dir}")
+
+# %% [Cell 4b] Find and drop any case with an image/label shape mismatch
+# "RuntimeError: Error while setting the slice" during preprocessing means one
+# case's imaging.nii.gz and segmentation.nii.gz have different array shapes —
+# usually a partial/interrupted download. This finds it directly with nibabel
+# instead of relying on nnU-Net's own crash message.
+import nibabel as nib
+
+bad_cases = []
+for img_path in sorted(images_dir.glob("*_0000.nii.gz")):
+    case_id = img_path.name.removesuffix("_0000.nii.gz")
+    label_path = labels_dir / f"{case_id}.nii.gz"
+    img_shape = nib.load(img_path).shape
+    label_shape = nib.load(label_path).shape
+    if img_shape != label_shape:
+        print(f"MISMATCH {case_id}: image {img_shape} vs label {label_shape}")
+        bad_cases.append(case_id)
+
+if bad_cases:
+    for case_id in bad_cases:
+        (images_dir / f"{case_id}_0000.nii.gz").unlink()
+        (labels_dir / f"{case_id}.nii.gz").unlink()
+    dataset_json["numTraining"] -= len(bad_cases)
+    (raw_dataset_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
+    print(f"Removed {len(bad_cases)} bad case(s): {bad_cases}")
+else:
+    print("No shape mismatches found — re-run Cell 5, the RuntimeError may be from something else.")
 
 # %% [Cell 5] Preprocess
 # Only preprocess the config we'll actually train (skips wasted 3d_lowres/3d_fullres

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate a professionally annotated axial chest CT image.
+Generate a professionally annotated axial abdomen CT image.
 
 Anatomical masks come from the pretrained TotalSegmentator "total" model.
-Optional nodule detections come only from a user-supplied TorchScript detector;
-this script never invents nodule locations.
+
+Note: the 6-class set here (Right Lung, Left Lung, Heart, Trachea, Aorta,
+Spine) is identical to chest_ct_annotation.py's, per explicit project
+decision — not liver/kidney/spleen/pancreas. See abdomen_classes.py.
 
 The JSON contour coordinates use the displayed radiological CT pixel coordinate
 system: origin at the top-left, x increasing rightward, y increasing downward.
@@ -25,7 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from chest_classes import (
+from abdomen_classes import (
     BASE_MODEL_STRUCTURES,
     DEFAULT_COLORS,
     DISPLAY_NAMES,
@@ -33,7 +35,7 @@ from chest_classes import (
 )
 
 
-LOGGER = logging.getLogger("chest_ct_annotation")
+LOGGER = logging.getLogger("abdomen_ct_annotation")
 WINDOW_CENTER = -600.0
 WINDOW_WIDTH = 1500.0
 
@@ -43,13 +45,6 @@ class LoadedCT:
     image: Any
     input_type: str
     warnings: List[str]
-
-
-@dataclass
-class NoduleDetection:
-    center_xyz: Tuple[float, float, float]
-    diameter_voxels: float
-    confidence: float
 
 
 def configure_logging(verbose: bool) -> None:
@@ -116,7 +111,7 @@ def load_dicom_series(path: Path) -> LoadedCT:
 
     if len(file_names) < 2:
         raise ValueError(
-            "The selected DICOM series has fewer than two files; a 3D chest CT is required."
+            "The selected DICOM series has fewer than two files; a 3D abdomen CT is required."
         )
 
     warnings = inspect_dicom_spacing(file_names)
@@ -382,69 +377,6 @@ def load_colors(raw: Optional[str], structure_keys: Sequence[str]) -> Dict[str, 
     return colors
 
 
-def run_nodule_detector(
-    enabled: bool,
-    checkpoint: Optional[str],
-    ct_data: np.ndarray,
-    device: str,
-) -> Tuple[List[NoduleDetection], Optional[str]]:
-    if not enabled:
-        return [], "Nodule detection was not requested."
-    if not checkpoint:
-        message = "Nodule detection is disabled because no nodule model/checkpoint was supplied."
-        LOGGER.warning(message)
-        return [], message
-
-    checkpoint_path = Path(checkpoint).expanduser().resolve()
-    if not checkpoint_path.exists():
-        message = f"Nodule detection is disabled because the checkpoint was not found: {checkpoint_path}"
-        LOGGER.warning(message)
-        return [], message
-
-    try:
-        import torch
-
-        model = torch.jit.load(str(checkpoint_path), map_location=device)
-        model.eval()
-        # Detector contract: input [1,1,Z,Y,X], clipped HU scaled to [-1,1].
-        normalized = np.clip(ct_data, -1000.0, 400.0)
-        normalized = ((normalized + 300.0) / 700.0).astype(np.float32)
-        tensor = torch.from_numpy(np.transpose(normalized, (2, 1, 0))[None, None]).to(device)
-        with torch.inference_mode():
-            prediction = model(tensor)
-        if isinstance(prediction, dict):
-            prediction = prediction.get("detections", prediction.get("boxes"))
-        if isinstance(prediction, (list, tuple)):
-            prediction = prediction[0]
-        rows = prediction.detach().cpu().numpy()
-        if rows.ndim == 1:
-            rows = rows[None, :]
-        if rows.ndim != 2 or rows.shape[1] < 5:
-            raise ValueError(
-                "expected Nx5 output rows [z, y, x, diameter_voxels, confidence]"
-            )
-        detections: List[NoduleDetection] = []
-        for z, y, x, diameter, confidence, *_ in rows:
-            if not np.all(np.isfinite([z, y, x, diameter, confidence])):
-                continue
-            if confidence < 0.5 or diameter <= 0:
-                continue
-            if not (0 <= x < ct_data.shape[0] and 0 <= y < ct_data.shape[1] and 0 <= z < ct_data.shape[2]):
-                continue
-            detections.append(
-                NoduleDetection(
-                    center_xyz=(float(x), float(y), float(z)),
-                    diameter_voxels=float(diameter),
-                    confidence=float(confidence),
-                )
-            )
-        return detections, None
-    except Exception as exc:
-        message = f"Nodule detection is disabled because detector inference failed: {exc}"
-        LOGGER.warning(message)
-        return [], message
-
-
 def window_ct(data: np.ndarray, center: float, width: float) -> np.ndarray:
     if width <= 0:
         raise ValueError("--window-width must be greater than zero.")
@@ -512,18 +444,8 @@ def choose_slice(
     requested: Optional[str],
     mask: np.ndarray,
     labels: Mapping[str, int],
-    nodules: Sequence[NoduleDetection],
 ) -> int:
     if requested is None or requested.lower() == "auto":
-        if nodules:
-            # Prefer a real nodule-containing slice while retaining anatomical context.
-            candidates = sorted({int(round(item.center_xyz[2])) for item in nodules})
-            candidates = [z for z in candidates if 0 <= z < mask.shape[2]]
-            if candidates:
-                return max(
-                    candidates,
-                    key=lambda z: np.count_nonzero(mask[:, :, z]),
-                )
         return informative_slice(mask, labels)
     if requested.lower() == "middle":
         return mask.shape[2] // 2
@@ -672,77 +594,6 @@ def build_slice_annotations(
     return annotations, structures
 
 
-def nodule_annotations(
-    nodules: Sequence[NoduleDetection],
-    z: int,
-    shape_xyz: Sequence[int],
-    spacing: Sequence[float],
-    color: str,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    width = int(shape_xyz[0])
-    height = int(shape_xyz[1])
-    annotations: List[Dict[str, Any]] = []
-    all_detections: List[Dict[str, Any]] = []
-    for index, item in enumerate(nodules, start=1):
-        x, y, center_z = item.center_xyz
-        display_x = float(width - 1 - x)
-        display_y = float(height - 1 - y)
-        radius = max(2.0, item.diameter_voxels / 2.0)
-        visible = abs(center_z - z) <= max(0.5, radius)
-        detection = {
-            "id": f"nodule_{index:03d}",
-            "center_xyz_voxel": [round(x, 3), round(y, 3), round(center_z, 3)],
-            "diameter_voxels": round(item.diameter_voxels, 3),
-            "confidence": round(item.confidence, 5),
-            "visible_on_slice": visible,
-        }
-        all_detections.append(detection)
-        if not visible:
-            continue
-        bbox = [
-            int(round(display_x - radius)),
-            int(round(display_y - radius)),
-            int(round(display_x + radius)),
-            int(round(display_y + radius)),
-        ]
-        theta = np.linspace(0, 2 * np.pi, 72)
-        contour = np.column_stack(
-            (display_x + radius * np.cos(theta), display_y + radius * np.sin(theta))
-        )
-        annotations.append(
-            {
-                "id": detection["id"],
-                "class": "Nodule",
-                "label": "nodule",
-                "type": "detection",
-                "slice_index": z,
-                "contours": [decimate_contour(contour)],
-                "bbox": bbox,
-                "center": [round(display_x, 2), round(display_y, 2)],
-                "diameter_voxels": round(item.diameter_voxels, 3),
-                "confidence": round(item.confidence, 5),
-                "source": "user_supplied_torchscript_nodule_detector",
-                "status": "pending_review",
-                "editable": True,
-                "color": color,
-            }
-        )
-    structure = {
-        "name": "Nodule",
-        "label": "nodule",
-        "model": "user_supplied_torchscript_nodule_detector",
-        "detected": bool(nodules),
-        "visible_on_slice": bool(annotations),
-        "mask_available": False,
-        "contour_available": bool(annotations),
-        "slice_index": z,
-        "detections": all_detections,
-        "confidence": max((item.confidence for item in nodules), default=None),
-        "color": color,
-    }
-    return annotations, structure
-
-
 def save_annotated_slice(
     destination: Path,
     ct_data: np.ndarray,
@@ -753,14 +604,12 @@ def save_annotated_slice(
     center: float,
     width: float,
     alpha: float,
-    nodule_items: Sequence[Dict[str, Any]],
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.patheffects as path_effects
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Circle
 
     ct_yx = to_radiological(window_ct(ct_data[:, :, z], center, width))
     mask_yx = to_radiological(mask[:, :, z])
@@ -812,37 +661,6 @@ def save_annotated_slice(
         )
         annotation.set_path_effects([path_effects.withStroke(linewidth=2, foreground="#000000")])
 
-    for item in nodule_items:
-        center_x, center_y = item["center"]
-        radius = item["diameter_voxels"] / 2.0
-        axis.add_patch(
-            Circle(
-                (center_x, center_y),
-                radius=radius,
-                fill=False,
-                edgecolor=colors["nodule"],
-                linewidth=2.2,
-                zorder=25,
-            )
-        )
-        axis.annotate(
-            f"Nodule ({item['confidence']:.2f})",
-            xy=(center_x, center_y),
-            xytext=(image_width * 1.10, min(height * 0.90, center_y)),
-            color="white",
-            fontsize=11,
-            fontweight="bold",
-            ha="left",
-            bbox=dict(
-                boxstyle="round,pad=0.35",
-                facecolor="#111a24",
-                edgecolor=colors["nodule"],
-                alpha=0.96,
-            ),
-            arrowprops=dict(arrowstyle="-", color=colors["nodule"], linewidth=1.6),
-            zorder=26,
-        )
-
     axis.text(
         0.02,
         1.02,
@@ -868,7 +686,7 @@ def save_annotated_slice(
     axis.text(
         0.5,
         1.02,
-        f"AI-annotated chest CT · axial slice {z}",
+        f"AI-annotated abdomen CT · axial slice {z}",
         transform=axis.transAxes,
         color="#d9e2ec",
         fontsize=11,
@@ -900,7 +718,7 @@ def save_mask(path: Path, mask: np.ndarray, reference: Any) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Segment a 3D chest CT and create a radiological annotated PNG with "
+            "Segment a 3D abdomen CT and create a radiological annotated PNG with "
             "transparent masks, contours, labels, and leader lines."
         ),
         epilog=(
@@ -917,7 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("totalsegmentator", "nnunet"),
         default="totalsegmentator",
         help="Segmentation backbone. nnunet uses labels from its own dataset.json "
-        "(TotalSegmentator's chest-structure grouping does not apply).",
+        "(TotalSegmentator's structure grouping does not apply).",
     )
     parser.add_argument(
         "--nnunet-model-dir",
@@ -951,18 +769,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--colors",
         help='JSON object or JSON file, e.g. \'{"heart":"#ff00aa"}\'.',
-    )
-    parser.add_argument(
-        "--enable-nodules",
-        action="store_true",
-        help="Enable optional inference using --nodule-checkpoint.",
-    )
-    parser.add_argument(
-        "--nodule-checkpoint",
-        help=(
-            "TorchScript checkpoint returning Nx5 [z,y,x,diameter_voxels,confidence]. "
-            "No nodule is drawn unless this detector returns one."
-        ),
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser
@@ -1014,27 +820,15 @@ def run(args: argparse.Namespace) -> int:
             verbose=args.verbose,
         )
         mask, labels = combine_anatomical_masks(raw_mask, label_map, extras)
-    colors = load_colors(args.colors, list(labels) + ["nodule"])
+    colors = load_colors(args.colors, list(labels))
 
-    print("Detecting nodules...")
-    nodules, nodule_message = run_nodule_detector(
-        enabled=args.enable_nodules,
-        checkpoint=args.nodule_checkpoint,
-        ct_data=ct_data,
-        device=torch_device,
-    )
-    selected_slice = choose_slice(args.slice, mask, labels, nodules)
+    selected_slice = choose_slice(args.slice, mask, labels)
 
     print("Generating contours...")
     model_name = "TotalSegmentator" if args.backend == "totalsegmentator" else f"nnunet/{args.nnunet_model_dir}"
     annotations, structures_by_key = build_slice_annotations(
         mask, labels, selected_slice, spacing, colors, model_name=model_name
     )
-    nodule_items, nodule_structure = nodule_annotations(
-        nodules, selected_slice, ct_data.shape, spacing, colors["nodule"]
-    )
-    annotations.extend(nodule_items)
-    structures_by_key["nodule"] = nodule_structure
 
     print("Generating annotations...")
     mask_path = output_dir / "segmentation_mask.nii.gz"
@@ -1063,7 +857,6 @@ def run(args: argparse.Namespace) -> int:
         center=args.window_center,
         width=args.window_width,
         alpha=args.overlay_alpha,
-        nodule_items=nodule_items,
     )
 
     payload = {
@@ -1110,10 +903,6 @@ def run(args: argparse.Namespace) -> int:
                 "TotalSegmentator hard-label output does not provide calibrated per-structure "
                 "confidence; anatomy confidence is null rather than fabricated."
             ),
-            "nodule_detector": (
-                "user_supplied_torchscript" if args.enable_nodules and not nodule_message else None
-            ),
-            "nodule_status": nodule_message or "enabled",
         },
         "volume": {
             "shape_xyz": [int(value) for value in ct_data.shape],
@@ -1128,7 +917,7 @@ def run(args: argparse.Namespace) -> int:
             "review_status": "pending_review",
             "operations": ["accept", "reject", "edit_contour", "move", "change_class", "delete"],
         },
-        "warnings": loaded.warnings + ([nodule_message] if nodule_message else []),
+        "warnings": loaded.warnings,
     }
     json_path = output_dir / "annotations.json"
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

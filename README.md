@@ -114,6 +114,48 @@ uv run python chest_ct_annotation.py --input Dataset\LIDC-IDRI-0021 --output res
 
 If you enable nodule detection without a checkpoint, the script skips nodule detection and writes a warning to the log and to `annotations.json`.
 
+## Training Your Own 6-Class Model
+
+By default the script segments with TotalSegmentator, a general-purpose 117-class model, and collapses its output down to the 6 chest classes shown above. You can instead train an owned nnU-Net v2 model that predicts exactly those 6 classes directly — smaller, faster at inference, and the only path that supports fine-tuning on your own corrected masks.
+
+`chest_classes.py` holds the single definition of the 6 classes (`CHEST_LABELS`) shared by the annotation tool and every script below, so a trained model's label names always line up with the annotator's colors and display names.
+
+### Step 1: Build pseudo-labels
+
+There is no public dataset with ground-truth masks for exactly these 6 classes, so training data comes from running TotalSegmentator itself over chest CT volumes — the trained model is a *student* of TotalSegmentator, and its accuracy on scans like the ones it trained on approaches TotalSegmentator's own, but does not exceed it. That ceiling lifts once you fine-tune on hand-corrected masks (Step 4).
+
+```
+uv run python build_pseudo_labels.py --input <folder of NIfTI files or DICOM series> --output <nnUNet_raw>/Dataset501_ChestCT --device cpu --fast
+```
+
+Drop `--fast` and use `--device cuda` for full-resolution labels on a GPU. The script prints a per-case, per-class voxel count and drops any case missing more than one of the 6 classes (usually a cropped field of view) rather than silently training on it.
+
+### Step 2: Train on Kaggle
+
+`kaggle_train_chest_nnunet.ipynb` downloads 63 public chest CT volumes from the Medical Segmentation Decathlon (Task06_Lung, images only — its tumor labels are unused), runs Step 1 over them, and trains nnU-Net v2 on a Kaggle GPU session. Paste each `# Cell N` block into its own notebook cell, in order, with internet and a GPU accelerator turned on. It prints per-class Dice from nnU-Net's own validation split at the end.
+
+Download the resulting `trained_model` folder from the notebook's Output tab.
+
+### Step 3: Run your trained model
+
+```
+uv run python chest_ct_annotation.py --input Dataset\LIDC-IDRI-0021 --output results --backend nnunet --nnunet-model-dir <path>\nnUNetTrainer_100epochs__nnUNetPlans__3d_fullres
+```
+
+Output format (overlays, `segmentation_mask.nii.gz`, `annotations.json`) is identical either way; `annotations.json`'s `model`/`source` fields report whichever backend actually ran.
+
+### Step 4: Fine-tune on corrections
+
+Once you've reviewed some predictions and corrected the mask (e.g. by editing `segmentation_mask.nii.gz`), feed the corrections back in:
+
+```
+uv run python finetune_chest_nnunet.py --corrected <folder of case_ct.nii.gz/case_mask.nii.gz pairs> --base-dataset-id 501 --new-dataset-id 502
+```
+
+This supports the same 6 classes with new/corrected data only — nnU-Net's fine-tuning path cannot add a 7th class without surgically resizing the trained model's output head, which nnU-Net does not do for you. Adding new classes later would be the trigger to move to a MONAI-based model instead.
+
+Note: `nnunetv2` is not pinned in this project's dependency file, so add it yourself before running any of the above (`uv add nnunetv2`).
+
 ## Troubleshooting
 
 CAUTION: Do not run this script against production patient data without review by a qualified radiologist. The script output is not a medical diagnosis.
@@ -125,3 +167,94 @@ CAUTION: Do not run this script against production patient data without review b
 **"No readable DICOM series found."** Check that the input folder contains valid DICOM files. Each series needs at least two files.
 
 **"Unknown TotalSegmentator structure name(s)."** Check the spelling of names given with `--structures`. Use only names from the TotalSegmentator `total` task.
+
+# Abdominal CT Annotation Script
+
+## What This Script Does
+
+`abdomen_ct_annotation.py` reads a 3D CT scan and draws structures with the TotalSegmentator model, the same way `chest_ct_annotation.py` does. Its class set is the same six structures as the chest script — Right Lung, Left Lung, Heart, Trachea, Aorta, and Spine — by explicit project decision, not liver/kidney/spleen/pancreas.
+
+The script accepts two input types: a NIfTI file (`.nii` or `.nii.gz`) or a folder of DICOM files.
+
+## Before You Start
+
+Same environment as the chest script — see [Before You Start](#before-you-start) above. No extra dependencies are needed.
+
+## How to Run the Script
+
+### Example 1: Run on a NIfTI File
+
+```
+uv run python abdomen_ct_annotation.py --input Dataset\kits19\case_00000\imaging.nii.gz --output results_abdomen
+```
+
+### Example 2: Run on a DICOM Folder
+
+```
+uv run python abdomen_ct_annotation.py --input Dataset\LIDC-IDRI-0021 --output results_abdomen
+```
+
+### Example 3: Run Faster on a CPU
+
+```
+uv run python abdomen_ct_annotation.py --input Dataset\kits19\case_00000\imaging.nii.gz --output results_abdomen --fast --device cpu
+```
+
+## What the Script Creates
+
+Same three outputs as the chest script: `annotated_slice.png`, `segmentation_mask.nii.gz`, `annotations.json`, plus one overlay image per slice in an `overlays` subfolder.
+
+## Common Options
+
+| Flag | What It Does |
+|---|---|
+| `--input`, `-i` | Path to a NIfTI file or a DICOM folder. Required. |
+| `--output`, `-o` | Path to the output folder. Required. |
+| `--device` | Set to `auto`, `cuda`, or `cpu`. Default: `auto`. |
+| `--fast` | Use the faster, lower-resolution model. |
+| `--slice` | Set to a slice number, `middle`, or `auto`. Default: `auto`. |
+| `--structures` | Add extra structure names from TotalSegmentator, separated by commas. |
+| `--colors` | Set custom colors. Give a JSON object or a path to a JSON file. |
+| `--verbose`, `-v` | Show detailed log messages. |
+
+For the full option list, run:
+
+```
+uv run python abdomen_ct_annotation.py --help
+```
+
+## Training Your Own 6-Class Model
+
+By default the script segments with TotalSegmentator and collapses its output down to the 6 classes shown above. You can instead train an owned nnU-Net v2 model that predicts exactly those 6 classes directly — smaller, faster at inference, and the only path that supports fine-tuning on your own corrected masks.
+
+`abdomen_classes.py` holds the single definition of the 6 classes (`ABDOMEN_LABELS`) shared by the annotation tool and every script below, so a trained model's label names always line up with the annotator's colors and display names.
+
+### Step 1: Build pseudo-labels
+
+```
+uv run python build_pseudo_labels_abdomen.py --input <folder of NIfTI files or DICOM series> --output <nnUNet_raw>/Dataset503_AbdomenCT --device cpu --fast
+```
+
+Drop `--fast` and use `--device cuda` for full-resolution labels on a GPU. The script prints a per-case, per-class voxel count and drops any case missing more than one of the 6 classes rather than silently training on it.
+
+### Step 2: Train on Kaggle
+
+`kaggle_train_abdomen_nnunet.ipynb` follows the same steps as `kaggle_train_chest_nnunet.ipynb` — downloads public CT volumes from the Medical Segmentation Decathlon, runs Step 1 over them, and trains nnU-Net v2 on a Kaggle GPU session. Paste each `# Cell N` block into its own notebook cell, in order, with internet and a GPU accelerator turned on.
+
+Download the resulting `trained_model` folder from the notebook's Output tab.
+
+### Step 3: Run your trained model
+
+```
+uv run python abdomen_ct_annotation.py --input Dataset\LIDC-IDRI-0021 --output results_abdomen --backend nnunet --nnunet-model-dir <path>\nnUNetTrainer_100epochs__nnUNetPlans__3d_fullres
+```
+
+### Step 4: Fine-tune on corrections
+
+```
+uv run python finetune_abdomen_nnunet.py --corrected <folder of case_ct.nii.gz/case_mask.nii.gz pairs> --base-dataset-id 503 --new-dataset-id 504
+```
+
+This supports the same 6 classes with new/corrected data only — same "can't add a 7th class" limit as the chest pipeline's fine-tuning script.
+
+Note: `nnunetv2` is not pinned in this project's dependency file, so add it yourself before running any of the above (`uv add nnunetv2`).

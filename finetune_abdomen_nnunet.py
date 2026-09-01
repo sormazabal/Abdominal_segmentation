@@ -96,6 +96,25 @@ def build_raw_dataset(corrected_dir: Path, raw_dataset_dir: Path) -> int:
     return count
 
 
+def print_validation_dice(results_root: Path, dataset_name: str, trainer: str, configuration: str, fold: int) -> None:
+    """Print per-class Dice from nnU-Net's own held-out validation split.
+
+    nnUNetv2_train writes this summary automatically after training finishes,
+    so no extra scoring code is needed.
+    """
+    summary_path = (
+        results_root / dataset_name / f"{trainer}__nnUNetPlans__{configuration}"
+        / f"fold_{fold}" / "validation" / "summary.json"
+    )
+    if not summary_path.exists():
+        print(f"No validation summary at {summary_path}.", file=sys.stderr)
+        return
+    summary = json.loads(summary_path.read_text())
+    print(f"\n{'class':<12}{'Dice':>8}")
+    for label, stats in summary["mean"].items():
+        print(f"{label:<12}{stats['Dice']:>8.3f}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--corrected", required=True, help="Directory of <case>_ct.nii.gz / <case>_mask.nii.gz pairs.")
@@ -158,6 +177,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"\n$ {printable}")
         if args.dry_run:
             continue
+        # nnUNetv2_train prints per-epoch loss and pseudo-Dice to stdout as it
+        # trains; not captured here so that progress streams live to the console.
         subprocess.run(command, check=True)
 
     if args.dry_run:
@@ -168,8 +189,9 @@ def run(args: argparse.Namespace) -> int:
             / f"{args.trainer}__nnUNetPlans__{args.configuration}" / f"fold_{args.fold}"
         )
         print(f"\nFine-tuned checkpoint: {fine_tuned_dir / 'checkpoint_final.pth'}")
+        print_validation_dice(nnUNet_results, new_dataset_name, args.trainer, args.configuration, args.fold)
         print(
-            "Run abdomen_ct_annotation.py with --backend nnunet --nnunet-model-dir "
+            "\nRun abdomen_ct_annotation.py with --backend nnunet --nnunet-model-dir "
             f"{nnUNet_results / new_dataset_name / f'{args.trainer}__nnUNetPlans__{args.configuration}'}"
         )
     return 0

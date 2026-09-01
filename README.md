@@ -258,3 +258,94 @@ uv run python finetune_abdomen_nnunet.py --corrected <folder of case_ct.nii.gz/c
 This supports the same 6 classes with new/corrected data only — same "can't add a 7th class" limit as the chest pipeline's fine-tuning script.
 
 Note: `nnunetv2` is not pinned in this project's dependency file, so add it yourself before running any of the above (`uv add nnunetv2`).
+
+# Running on a Remote GPU Machine
+
+These steps set up and run either script on a shared Windows GPU machine reached over VPN + RDP.
+
+## Step 1: Connect
+
+1. Connect to the VPN.
+2. Open Remote Desktop Connection and log in to the GPU machine.
+
+## Step 2: Install uv
+
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Close and reopen the terminal, then confirm:
+
+```powershell
+uv --version
+```
+
+## Step 3: Get the code onto the machine
+
+If your repo is private and the machine isn't logged in to GitHub, use a personal access token:
+
+```powershell
+git clone https://<your-github-username>:<personal-access-token>@github.com/<owner>/<repo>.git
+```
+
+## Step 4: Install the environment
+
+```powershell
+uv sync
+```
+
+For the nnU-Net training/fine-tuning scripts, also run:
+
+```powershell
+uv add nnunetv2
+```
+
+## Step 5: Download your dataset from Kaggle
+
+The GPU machine's login (e.g. `MLuser4`) may be shared with other people, so do not save your Kaggle credentials permanently — set them per-session instead:
+
+```powershell
+$env:KAGGLE_USERNAME = "<your-kaggle-username>"
+$env:KAGGLE_KEY = "<your-kaggle-key>"
+uv run kaggle datasets download -d <owner>/<dataset-name> -p .\Dataset --unzip
+```
+
+Get `<your-kaggle-key>` from kaggle.com → Settings → API → "Create New Token". If someone else's `kaggle.json` already exists at `C:\Users\<login>\.kaggle\kaggle.json`, do not delete it — that account is shared, so back it up first (`Rename-Item kaggle.json kaggle.json.bak`) before writing your own, and swap yours back out when you are done.
+
+## Step 6: Run with GPU acceleration
+
+Drop `--fast` and `--device cpu` — on this machine, use the GPU directly:
+
+```powershell
+uv run python chest_ct_annotation.py --input Dataset\kits19\case_00000\imaging.nii.gz --output results --device cuda
+```
+
+```powershell
+uv run python abdomen_ct_annotation.py --input Dataset\kits19\case_00000\imaging.nii.gz --output results_abdomen --device cuda
+```
+
+Confirm the GPU is visible before a long run:
+
+```powershell
+uv run python -c "import torch; print(torch.cuda.is_available())"
+```
+
+## Step 7: Fine-tune on corrected masks
+
+Once you have reviewed some predictions and corrected the masks, fine-tune directly on this machine's GPU instead of going back to Kaggle. Each corrected case needs a `case_ct.nii.gz`/`case_mask.nii.gz` pair in one folder.
+
+For the chest model:
+
+```powershell
+uv run python finetune_chest_nnunet.py --corrected <folder of case_ct.nii.gz/case_mask.nii.gz pairs> --base-dataset-id 501 --new-dataset-id 502
+```
+
+For the abdomen model:
+
+```powershell
+uv run python finetune_abdomen_nnunet.py --corrected <folder of case_ct.nii.gz/case_mask.nii.gz pairs> --base-dataset-id 503 --new-dataset-id 504
+```
+
+Both require `nnunetv2` (Step 4) and the base dataset ID's training run to already exist under `nnUNet_raw`/`nnUNet_preprocessed` on this machine. Run the resulting model the same way as [Step 3](#step-3-run-your-trained-model) in the training sections above, pointing `--nnunet-model-dir` at the new dataset ID's output folder.
+
+While training runs, `nnUNetv2_train` prints per-epoch loss and pseudo-Dice straight to the console — nothing extra to do to watch progress live. When it finishes, the script prints per-class Dice from nnU-Net's own held-out validation split, so you get a metrics summary without a separate evaluation step.

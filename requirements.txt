@@ -1,0 +1,6 @@
+numpy
+requests
+tqdm
+nibabel
+nnunetv2
+torch

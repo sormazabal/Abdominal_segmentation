@@ -257,6 +257,16 @@ uv run python finetune_abdomen_nnunet.py --corrected <folder of case_ct.nii.gz/c
 
 This supports the same 6 classes with new/corrected data only — same "can't add a 7th class" limit as the chest pipeline's fine-tuning script.
 
+#### Example: fine-tune on corrected KITS19 cases
+
+`Dataset\kits19` holds raw KITS19 CT volumes (`imaging.nii.gz` per case, no mask) — review each one in `abdomen_ct_annotation.py`, correct the predicted mask, and save the pair as `<case>_ct.nii.gz` / `<case>_mask.nii.gz` into one folder before fine-tuning:
+
+```
+uv run python finetune_abdomen_nnunet.py --corrected Dataset\kits19_corrected --base-dataset-id 503 --new-dataset-id 504
+```
+
+`--base-dataset-id 503` must already have a trained model under `nnUNet_results` (Step 2); `--new-dataset-id 504` is a fresh id for the KITS19-derived fine-tune.
+
 Note: `nnunetv2` is not pinned in this project's dependency file, so add it yourself before running any of the above (`uv add nnunetv2`).
 
 # Running on a Remote GPU Machine

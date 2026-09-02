@@ -130,14 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     import os
 
-    nnUNet_raw = Path(os.environ.get("nnUNet_raw", ""))
-    nnUNet_preprocessed = Path(os.environ.get("nnUNet_preprocessed", ""))
-    nnUNet_results = Path(os.environ.get("nnUNet_results", ""))
-    if not (nnUNet_raw and nnUNet_preprocessed and nnUNet_results):
+    nnUNet_raw_str = os.environ.get("nnUNet_raw")
+    nnUNet_preprocessed_str = os.environ.get("nnUNet_preprocessed")
+    nnUNet_results_str = os.environ.get("nnUNet_results")
+    if not (nnUNet_raw_str and nnUNet_preprocessed_str and nnUNet_results_str):
         raise RuntimeError(
             "nnUNet_raw, nnUNet_preprocessed, and nnUNet_results must be set "
             "(same env vars used by kaggle_train_abdomen_nnunet.ipynb)."
         )
+    nnUNet_raw = Path(nnUNet_raw_str)
+    nnUNet_preprocessed = Path(nnUNet_preprocessed_str)
+    nnUNet_results = Path(nnUNet_results_str)
 
     base_dataset_name = f"Dataset{args.base_dataset_id}_AbdomenCT"
     new_dataset_name = f"Dataset{args.new_dataset_id}_AbdomenCTCorrected"

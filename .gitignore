@@ -16,3 +16,5 @@ wheels/
 uv.lock
 Dataset.zip
 Abdominal_CT.zip
+nnUNet_preprocessed
+nnUNet_raw

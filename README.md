@@ -401,3 +401,39 @@ uv run python finetune_abdomen_nnunet.py --corrected <folder of case_ct.nii.gz/c
 Both require `nnunetv2` (Step 4) and the base dataset ID's training run to already exist under `nnUNet_raw`/`nnUNet_preprocessed` on this machine. Run the resulting model the same way as [Step 3](#step-3-run-your-trained-model) in the training sections above, pointing `--nnunet-model-dir` at the new dataset ID's output folder.
 
 While training runs, `nnUNetv2_train` prints per-epoch loss and pseudo-Dice straight to the console — nothing extra to do to watch progress live. When it finishes, the script prints per-class Dice from nnU-Net's own held-out validation split, so you get a metrics summary without a separate evaluation step.
+
+## Understanding the Training Log
+
+Each epoch, `nnUNetv2_train` prints a block like this:
+
+```
+Epoch 2
+Current learning rate: 0.00998
+train_loss 0.3964
+val_loss 0.4838
+Pseudo dice [0.0004, 0.0755, 0.0699, 0.0, 0.0, 0.3046]
+Epoch time: 88.6 s
+```
+
+**Pseudo dice** is a fast, approximate per-class Dice score nnU-Net computes during validation, one value per foreground class (background is excluded), each ranging from 0 to 1 (higher is better). It's called "pseudo" because it comes from a cheap, on-the-fly approximation — hard argmax predictions on patches, aggregated online — rather than a full sliding-window inference with proper post-processing. Treat it as a training-time trend indicator, not the final score for the model.
+
+For the 6-class datasets in this project (chest or abdomen), the list has 6 entries in class order — e.g. `[Right Lung, Left Lung, Heart, Trachea, Aorta, Spine]`.
+
+**What to expect:**
+- Near 0 in the first few epochs — this is normal, not a bug.
+- A steady climb over subsequent epochs, plateauing later in training.
+- If a class is still near 0 after many epochs (50+) while the others have climbed, that class likely has a data problem (missing/mislabeled in the pseudo-labels, too few examples, or a cropped field of view for that structure).
+
+**Rough score guide (per class, once training has progressed):**
+
+| Score | Interpretation |
+|---|---|
+| 0.0–0.3 | Poor — still learning, or a genuinely hard/rare class |
+| 0.3–0.6 | Weak — expected mid-training, or a persistently hard class |
+| 0.6–0.8 | Decent — typical for small or low-contrast structures |
+| 0.8–0.9 | Good — typical target for well-defined structures |
+| 0.9+ | Excellent — common for large, well-defined structures |
+
+Small or thin structures (e.g. Trachea, Aorta) often plateau lower than large ones (e.g. lungs, spine) even in a well-trained model — that's expected, not a sign of failure. What matters most is the *trend* across epochs and whether one class lags far behind the rest for an extended stretch, not any single epoch's absolute number.
+
+The pseudo-dice values you see during training are a proxy only. The number to actually trust is the **final per-class Dice** nnU-Net reports at the end of training from its held-out validation split (see above) — that uses real inference rather than the cheap patch-based approximation.

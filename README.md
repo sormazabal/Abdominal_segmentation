@@ -243,6 +243,48 @@ Drop `--fast` and use `--device cuda` for full-resolution labels on a GPU. The s
 
 Download the resulting `trained_model` folder from the notebook's Output tab.
 
+### Step 2, alternative: Train locally with train_abdomen_nnunet.py
+
+If you have your own CT data and a GPU on the machine you're already working on, `train_abdomen_nnunet.py` runs the same pipeline as Step 1 + Step 2 end to end — pseudo-label, preprocess, train, print per-class Dice — without going through Kaggle:
+
+```
+uv run python train_abdomen_nnunet.py --input <folder of NIfTI files or DICOM series> --dataset-id 503 --device cuda
+```
+
+It sets `nnUNet_raw`/`nnUNet_preprocessed`/`nnUNet_results` under `--work-dir` (default `nnUNet_work`) if those env vars aren't already set in your shell, and writes the trained checkpoint to `<work-dir>\nnUNet_results\Dataset503_AbdomenCT\nnUNetTrainer_100epochs__nnUNetPlans__3d_fullres\fold_0\checkpoint_final.pth`.
+
+#### Example: training on KITS19 volumes
+
+`Dataset\kits19` holds raw KITS19 CT volumes. KITS19 is a kidney/tumor dataset, and this project's 6 classes are Right Lung, Left Lung, Heart, Trachea, Aorta, and Spine (no kidney) — so KITS19 only helps here as extra abdominal CT *volumes* for pseudo-labeling whichever of those 6 structures fall inside each scan's field of view, not as kidney training data. Download the full imaging data first (see the [official kits19 instructions](https://github.com/neheller/kits19)) — it ships as `data\case_00000\imaging.nii.gz` (plus a `segmentation.nii.gz` you don't need here) through `case_00299`, 300 cases in total.
+
+`build_pseudo_labels_abdomen.py`'s case discovery expects one `.nii.gz` file (or one DICOM folder) per top-level entry under `--input`, so KITS19's nested `case_XXXXX\imaging.nii.gz` layout needs flattening first — hard links avoid duplicating the ~60GB of imaging data (same-volume hard links need no admin rights):
+
+```powershell
+$src = "Dataset\kits19\data"
+$dest = "Dataset\kits19_flat"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+Get-ChildItem $src -Directory | ForEach-Object {
+    $imaging = Join-Path $_.FullName "imaging.nii.gz"
+    if (Test-Path $imaging) {
+        $link = Join-Path $dest "$($_.Name).nii.gz"
+        cmd /c mklink /H "`"$link`"" "`"$imaging`"" | Out-Null
+    }
+}
+
+(Get-ChildItem $dest -Filter *.nii.gz).Count   # should print 300
+```
+
+Then train against the flattened folder:
+
+```powershell
+uv run python train_abdomen_nnunet.py --input Dataset\kits19_flat --dataset-id 503 --device cuda
+```
+
+(`--work-dir` defaults to `nnUNet_work`, matching the folder this pipeline already uses.)
+
+Note: pseudo-labeling runs TotalSegmentator once per case, so 300 cases is real GPU time — hours, not minutes. To sanity-check the pipeline first, point `--input` at a subfolder holding a smaller slice of `kits19_flat` (e.g. its first 20-30 cases) before committing to the full run.
+
 ### Step 3: Run your trained model
 
 ```
@@ -251,21 +293,21 @@ uv run python abdomen_ct_annotation.py --input Dataset\LIDC-IDRI-0021 --output r
 
 ### Step 4: Fine-tune on corrections
 
+Once Step 2 (or its local alternative) has produced a `checkpoint_final.pth` for `--base-dataset-id`, you can fine-tune it further on hand-corrected masks:
+
 ```
 uv run python finetune_abdomen_nnunet.py --corrected <folder of case_ct.nii.gz/case_mask.nii.gz pairs> --base-dataset-id 503 --new-dataset-id 504
 ```
 
-This supports the same 6 classes with new/corrected data only — same "can't add a 7th class" limit as the chest pipeline's fine-tuning script.
+This supports the same 6 classes with new/corrected data only — same "can't add a 7th class" limit as the chest pipeline's fine-tuning script. `--base-dataset-id` must already have a checkpoint under `nnUNet_results` (from Step 2 or its local alternative above) or this fails with "No checkpoint at ...".
 
-#### Example: fine-tune on corrected KITS19 cases
+Both `train_abdomen_nnunet.py` and `finetune_abdomen_nnunet.py` need `nnUNet_raw`, `nnUNet_preprocessed`, and `nnUNet_results` set to the *same* paths across runs — if you trained locally with the default `--work-dir nnUNet_work`, set these in your shell before fine-tuning, or fine-tuning will look in the wrong (or an empty) place:
 
-`Dataset\kits19` holds raw KITS19 CT volumes (`imaging.nii.gz` per case, no mask) — review each one in `abdomen_ct_annotation.py`, correct the predicted mask, and save the pair as `<case>_ct.nii.gz` / `<case>_mask.nii.gz` into one folder before fine-tuning:
-
+```powershell
+$env:nnUNet_raw = "<repo path>\nnUNet_work\nnUNet_raw"
+$env:nnUNet_preprocessed = "<repo path>\nnUNet_work\nnUNet_preprocessed"
+$env:nnUNet_results = "<repo path>\nnUNet_work\nnUNet_results"
 ```
-uv run python finetune_abdomen_nnunet.py --corrected Dataset\kits19_corrected --base-dataset-id 503 --new-dataset-id 504
-```
-
-`--base-dataset-id 503` must already have a trained model under `nnUNet_results` (Step 2); `--new-dataset-id 504` is a fresh id for the KITS19-derived fine-tune.
 
 Note: `nnunetv2` is not pinned in this project's dependency file, so add it yourself before running any of the above (`uv add nnunetv2`).
 

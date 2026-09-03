@@ -120,6 +120,19 @@ By default the script segments with TotalSegmentator, a general-purpose 117-clas
 
 `chest_classes.py` holds the single definition of the 6 classes (`CHEST_LABELS`) shared by the annotation tool and every script below, so a trained model's label names always line up with the annotator's colors and display names.
 
+### Script Order
+
+Run the scripts below in this order. Each step's output is the next step's input, so skipping or reordering them will fail or silently train on the wrong data.
+
+| Order | Script | Input Data | Why This Step |
+|---|---|---|---|
+| 1 | `build_pseudo_labels.py` | Raw chest CT volumes (NIfTI or DICOM) with no ground-truth masks | Generates training labels by running TotalSegmentator over your volumes, since no public dataset has ground-truth masks for exactly these 6 classes |
+| 2 | `kaggle_train_chest_nnunet.ipynb` | The pseudo-labeled dataset from Step 1 (built inside the notebook, using 63 public Medical Segmentation Decathlon volumes) | Trains nnU-Net v2 on a free Kaggle GPU, since most people don't have a local GPU for this |
+| 3 | `chest_ct_annotation.py --backend nnunet` | Any new chest CT scan, plus the `trained_model` folder downloaded from Step 2 | Runs your trained model instead of TotalSegmentator, so you can check its predictions on real cases |
+| 4 (optional) | `finetune_chest_nnunet.py` | Hand-corrected `case_ct.nii.gz`/`case_mask.nii.gz` pairs made by fixing Step 3's output | Improves accuracy past TotalSegmentator's own ceiling, since Step 2's model only ever learned to imitate TotalSegmentator |
+
+Step 4 is optional and only becomes available once you have corrected masks to fine-tune on — it is the only step that can push accuracy beyond the pseudo-labels' own quality, because Steps 1-2 train the model to imitate TotalSegmentator and can never exceed it.
+
 ### Step 1: Build pseudo-labels
 
 There is no public dataset with ground-truth masks for exactly these 6 classes, so training data comes from running TotalSegmentator itself over chest CT volumes — the trained model is a *student* of TotalSegmentator, and its accuracy on scans like the ones it trained on approaches TotalSegmentator's own, but does not exceed it. That ceiling lifts once you fine-tune on hand-corrected masks (Step 4).
@@ -228,6 +241,20 @@ uv run python abdomen_ct_annotation.py --help
 By default the script segments with TotalSegmentator and collapses its output down to the 6 classes shown above. You can instead train an owned nnU-Net v2 model that predicts exactly those 6 classes directly — smaller, faster at inference, and the only path that supports fine-tuning on your own corrected masks.
 
 `abdomen_classes.py` holds the single definition of the 6 classes (`ABDOMEN_LABELS`) shared by the annotation tool and every script below, so a trained model's label names always line up with the annotator's colors and display names.
+
+### Script Order
+
+Run the scripts below in this order. Each step's output is the next step's input, so skipping or reordering them will fail or silently train on the wrong data. Pick either row 2 or row 2-alt, not both — they do the same job, just on Kaggle vs. locally.
+
+| Order | Script | Input Data | Why This Step |
+|---|---|---|---|
+| 1 | `build_pseudo_labels_abdomen.py` | Raw CT volumes (NIfTI or DICOM) with no ground-truth masks | Generates training labels by running TotalSegmentator over your volumes, since no public dataset has ground-truth masks for exactly these 6 classes |
+| 2 | `kaggle_train_abdomen_nnunet.ipynb` | The pseudo-labeled dataset from Step 1 (built inside the notebook, using public Medical Segmentation Decathlon volumes) | Trains nnU-Net v2 on a free Kaggle GPU, when you don't have a local GPU |
+| 2-alt | `train_abdomen_nnunet.py` | Raw CT volumes on disk (e.g. `Dataset\kits19_flat` — see the KITS19 example below), used directly since this script runs Steps 1+2 itself | Runs pseudo-labeling and training end to end on a local GPU, skipping Kaggle entirely, when you already have your own data and hardware |
+| 3 | `abdomen_ct_annotation.py --backend nnunet` | Any new CT scan, plus the trained checkpoint from Step 2 or 2-alt | Runs your trained model instead of TotalSegmentator, so you can check its predictions on real cases |
+| 4 (optional) | `finetune_abdomen_nnunet.py` | Hand-corrected `case_ct.nii.gz`/`case_mask.nii.gz` pairs made by fixing Step 3's output | Improves accuracy past TotalSegmentator's own ceiling, since Steps 1-2's model only ever learned to imitate TotalSegmentator |
+
+Step 4 is optional and only becomes available once you have corrected masks to fine-tune on — it is the only step that can push accuracy beyond the pseudo-labels' own quality, because Steps 1-2 (or 2-alt) train the model to imitate TotalSegmentator and can never exceed it.
 
 ### Step 1: Build pseudo-labels
 
@@ -437,3 +464,16 @@ For the 6-class datasets in this project (chest or abdomen), the list has 6 entr
 Small or thin structures (e.g. Trachea, Aorta) often plateau lower than large ones (e.g. lungs, spine) even in a well-trained model — that's expected, not a sign of failure. What matters most is the *trend* across epochs and whether one class lags far behind the rest for an extended stretch, not any single epoch's absolute number.
 
 The pseudo-dice values you see during training are a proxy only. The number to actually trust is the **final per-class Dice** nnU-Net reports at the end of training from its held-out validation split (see above) — that uses real inference rather than the cheap patch-based approximation.
+
+### When one class lags far behind the others
+
+It's normal for pseudo-dice to be flat/near-zero across the board in the first ~20-30 epochs. It's a different situation when *most* classes are climbing and one or two stay stuck at 0, or when a symmetric pair of structures (e.g. Right Lung vs. Left Lung) diverges sharply from each other. That pattern usually points to a problem in the pseudo-labels themselves rather than something training will fix on its own.
+
+If you see this past epoch ~30-50, check the lagging class's pseudo-labels before training further:
+
+1. **Re-check the per-case, per-class voxel counts** that `build_pseudo_labels.py` / `build_pseudo_labels_abdomen.py` printed when you built the dataset. A class with a suspiciously low or zero voxel count across many cases means TotalSegmentator didn't find that structure in those volumes (often a cropped field of view), and the model can't learn what it never saw labeled.
+2. **Open a few pseudo-label masks directly** (e.g. in [3D Slicer](https://www.slicer.org/) or `itksnap`) for cases where the lagging class should clearly be present, and confirm the label is actually there, in the right place, and not swapped with a neighboring class (e.g. right/left flipped, or merged into the wrong structure).
+3. **Check `CHEST_LABELS` / `ABDOMEN_LABELS` in `chest_classes.py` / `abdomen_classes.py`** against the order nnU-Net is printing pseudo-dice in — if the label-to-index mapping is off by one somewhere in the pipeline, you'd see exactly this kind of "one class never learns" pattern even though the label data is fine.
+4. **Count how many training cases actually contain the lagging class.** If `build_pseudo_labels.py` dropped many cases for missing that structure, you may simply not have enough examples of it — a real, fixable data problem rather than a training bug.
+
+If the labels check out and the class is just inherently small or low-contrast (e.g. Trachea, Aorta), a slower climb — or a lower plateau — is expected and not a sign of a broken pipeline.

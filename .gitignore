@@ -16,5 +16,8 @@ wheels/
 uv.lock
 Dataset.zip
 Abdominal_CT.zip
-nnUNet_preprocessed
-nnUNet_raw
+nnUNet_raw/
+nnUNet_preprocessed/
+nnUNet_results/
+*.pth
+nnUNet_results/Dataset503_AbdomenCT/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/debug.json
